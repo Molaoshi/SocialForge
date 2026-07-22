@@ -1,11 +1,14 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+import re
+import httpx
 
 from models import init_db, get_db, Post
 from content_generator import load_posts_from_json
@@ -14,12 +17,15 @@ from imagine import generate_image
 app = FastAPI(
     title="SocialForge",
     description="AI-Powered Social Media Automation with Grok 4.5 + Grok Imagine",
-    version="0.5.0",
+    version="0.6.0",
 )
 
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+# Simple in-memory cache for proxied Drive images (file_id -> bytes)
+_image_cache: dict[str, tuple[bytes, str]] = {}
 
 @app.on_event("startup")
 def startup():
@@ -60,7 +66,57 @@ class GenerateImageResponse(BaseModel):
 class BatchGenerateRequest(BaseModel):
     limit: int = 5
     only_missing: bool = True
-    force: bool = False  # if True, regenerate even when image_url exists
+    force: bool = False
+
+
+def extract_drive_file_id(url: str) -> Optional[str]:
+    """Extract Google Drive file ID from common URL shapes."""
+    if not url:
+        return None
+    # /uc?export=view&id=FILE_ID
+    m = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
+    if m:
+        return m.group(1)
+    # /file/d/FILE_ID/
+    m = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
+    if m:
+        return m.group(1)
+    # /d/FILE_ID
+    m = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
+    if m:
+        return m.group(1)
+    # already a bare file id
+    if re.fullmatch(r'[a-zA-Z0-9_-]{20,}', url.strip()):
+        return url.strip()
+    return None
+
+
+def to_proxy_url(url: Optional[str]) -> Optional[str]:
+    """Rewrite Drive URLs to our local proxy so <img> tags work."""
+    if not url:
+        return None
+    fid = extract_drive_file_id(url)
+    if fid:
+        return f"/media/drive/{fid}"
+    return url
+
+
+def serialize_post(post: Post) -> dict:
+    return {
+        "id": post.id,
+        "external_id": post.external_id,
+        "topic": post.topic,
+        "quote": post.quote,
+        "content": post.content,
+        "boldness": post.boldness,
+        "image_prompt": post.image_prompt,
+        "image_url": to_proxy_url(post.image_url),
+        "platforms": post.platforms,
+        "status": post.status,
+        "scheduled_at": post.scheduled_at,
+        "posted_at": post.posted_at,
+        "created_at": post.created_at,
+    }
 
 # ---------- UI ----------
 @app.get("/")
@@ -72,10 +128,55 @@ def ui():
 
 @app.get("/api")
 def api_root():
-    return {"message": "SocialForge API", "version": "0.5.0", "docs": "/docs"}
+    return {"message": "SocialForge API", "version": "0.6.0", "docs": "/docs"}
+
+# ---------- Drive image proxy ----------
+@app.get("/media/drive/{file_id}")
+async def proxy_drive_image(file_id: str):
+    """
+    Proxy a public Google Drive file so it can be embedded in <img> tags.
+    Caches in memory after first fetch.
+    """
+    if file_id in _image_cache:
+        data, content_type = _image_cache[file_id]
+        return Response(content=data, media_type=content_type, headers={
+            "Cache-Control": "public, max-age=86400",
+        })
+
+    # Prefer the download endpoint; falls back to view
+    urls = [
+        f"https://drive.google.com/uc?export=download&id={file_id}",
+        f"https://drive.google.com/uc?export=view&id={file_id}",
+        f"https://drive.google.com/thumbnail?id={file_id}&sz=w2000",
+    ]
+
+    last_error = None
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+        for url in urls:
+            try:
+                r = await client.get(url, headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; SocialForge/0.6)",
+                })
+                if r.status_code == 200 and r.content and len(r.content) > 1000:
+                    content_type = r.headers.get("content-type", "image/jpeg")
+                    # Skip HTML error pages Google sometimes returns
+                    if "text/html" in content_type:
+                        continue
+                    _image_cache[file_id] = (r.content, content_type)
+                    return Response(content=r.content, media_type=content_type, headers={
+                        "Cache-Control": "public, max-age=86400",
+                    })
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"Could not fetch Drive file {file_id}. {last_error or 'Check sharing is Anyone with the link'}",
+    )
 
 # ---------- Posts ----------
-@app.get("/posts", response_model=List[PostOut])
+@app.get("/posts")
 def list_posts(
     status: Optional[str] = Query(None),
     boldness: Optional[str] = Query(None),
@@ -92,14 +193,15 @@ def list_posts(
         query = query.filter(Post.image_url.isnot(None))
     elif has_image is False:
         query = query.filter(Post.image_url.is_(None))
-    return query.order_by(Post.external_id).limit(limit).all()
+    posts = query.order_by(Post.external_id).limit(limit).all()
+    return [serialize_post(p) for p in posts]
 
-@app.get("/posts/{post_id}", response_model=PostOut)
+@app.get("/posts/{post_id}")
 def get_post(post_id: int, db: Session = Depends(get_db)):
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    return post
+    return serialize_post(post)
 
 @app.get("/posts/batch/rejection")
 def get_rejection_json():
@@ -117,7 +219,7 @@ def seed_posts(db: Session = Depends(get_db)):
         "posts_with_images": with_images,
     }
 
-@app.patch("/posts/{post_id}/status", response_model=PostOut)
+@app.patch("/posts/{post_id}/status")
 def update_status(post_id: int, body: StatusUpdate, db: Session = Depends(get_db)):
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
@@ -127,35 +229,33 @@ def update_status(post_id: int, body: StatusUpdate, db: Session = Depends(get_db
         post.posted_at = datetime.utcnow()
     db.commit()
     db.refresh(post)
-    return post
+    return serialize_post(post)
 
-@app.patch("/posts/{post_id}/image-url", response_model=PostOut)
+@app.patch("/posts/{post_id}/image-url")
 def set_image_url(post_id: int, body: ImageUrlUpdate, db: Session = Depends(get_db)):
-    """Manually set / override the image URL for a post (no API call)."""
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     post.image_url = body.image_url
     db.commit()
     db.refresh(post)
-    return post
+    return serialize_post(post)
 
-# ---------- Image generation (API only when needed) ----------
+# ---------- Image generation ----------
 @app.post("/posts/{post_id}/generate-image", response_model=GenerateImageResponse)
 def generate_post_image(
     post_id: int,
-    force: bool = Query(False, description="Regenerate even if image_url already exists"),
+    force: bool = Query(False),
     db: Session = Depends(get_db),
 ):
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    # Prefer existing URL — no API call
     if post.image_url and not force:
         return GenerateImageResponse(
             post_id=post.id,
-            image_url=post.image_url,
+            image_url=to_proxy_url(post.image_url),
             success=True,
             message="Using existing image_url (no API call)",
             source="existing",
@@ -172,7 +272,7 @@ def generate_post_image(
         db.refresh(post)
         return GenerateImageResponse(
             post_id=post.id,
-            image_url=image_url,
+            image_url=to_proxy_url(image_url),
             success=True,
             message="Image generated via xAI API",
             source="api",
@@ -180,7 +280,7 @@ def generate_post_image(
 
     return GenerateImageResponse(
         post_id=post.id,
-        image_url=post.image_url,
+        image_url=to_proxy_url(post.image_url),
         success=False,
         message="API generation failed. Set image_url manually or add credits at console.x.ai",
         source="api",
@@ -198,12 +298,11 @@ def generate_images_batch(body: BatchGenerateRequest, db: Session = Depends(get_
 
     results = []
     for post in posts:
-        # Prefer existing
         if post.image_url and not body.force:
             results.append({
                 "post_id": post.id,
                 "success": True,
-                "image_url": post.image_url,
+                "image_url": to_proxy_url(post.image_url),
                 "source": "existing",
             })
             continue
@@ -218,7 +317,7 @@ def generate_images_batch(body: BatchGenerateRequest, db: Session = Depends(get_
             results.append({
                 "post_id": post.id,
                 "success": True,
-                "image_url": image_url,
+                "image_url": to_proxy_url(image_url),
                 "source": "api",
             })
         else:
@@ -240,4 +339,4 @@ def generate_images_batch(body: BatchGenerateRequest, db: Session = Depends(get_
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat(), "cached_images": len(_image_cache)}
