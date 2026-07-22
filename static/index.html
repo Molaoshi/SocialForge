@@ -55,16 +55,14 @@
         <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-cyan-400 to-fuchsia-500 flex items-center justify-center font-bold text-black text-lg">S</div>
         <div>
           <h1 class="text-xl font-bold tracking-tight">SocialForge</h1>
-          <p class="text-xs text-gray-500">Grok 4.5 + Imagine</p>
+          <p class="text-xs text-gray-500">Grok + Imagine → X</p>
         </div>
       </div>
       <div class="flex items-center gap-3">
         <span id="db-count" class="text-sm text-gray-400">— posts</span>
+        <span id="x-status" class="text-xs px-2 py-1 rounded-full bg-cyber-border text-gray-400">X: …</span>
         <button onclick="seedPosts()" class="btn px-4 py-2 rounded-lg bg-cyber-border hover:bg-cyber-border/80 text-sm font-medium">
           Seed DB
-        </button>
-        <button onclick="batchGenerate()" class="btn px-4 py-2 rounded-lg bg-gradient-to-r from-cyan-500 to-fuchsia-500 text-black font-semibold text-sm glow-cyan">
-          Generate (API)
         </button>
       </div>
     </div>
@@ -93,7 +91,9 @@
       <button onclick="loadPosts()" class="btn px-4 py-2 rounded-lg border border-cyber-border hover:border-cyan-500 text-sm">Refresh</button>
       <div id="status-msg" class="ml-auto text-sm text-gray-400"></div>
     </div>
-    <p class="text-xs text-gray-500 mt-3">Tip: Use <strong>Set URL</strong> on a card to attach a pre-generated image (no API credits needed).</p>
+    <p class="text-xs text-gray-500 mt-3">
+      <strong>Post to X</strong> = publish now · <strong>Schedule</strong> = auto-post in ~1 min (scheduler runs every 2 min)
+    </p>
   </div>
 
   <main class="max-w-7xl mx-auto px-4 pb-16">
@@ -116,11 +116,26 @@
         'bg-cyber-card border-cyber-border text-gray-200'
       }`;
       el.style.opacity = '1';
-      setTimeout(() => el.style.opacity = '0', 3500);
+      setTimeout(() => el.style.opacity = '0', 4000);
     }
 
     function setStatus(msg) {
       document.getElementById('status-msg').textContent = msg;
+    }
+
+    async function checkX() {
+      try {
+        const res = await fetch('/health');
+        const data = await res.json();
+        const el = document.getElementById('x-status');
+        if (data.x_configured) {
+          el.textContent = 'X: ready';
+          el.className = 'text-xs px-2 py-1 rounded-full bg-emerald-950 text-emerald-300';
+        } else {
+          el.textContent = 'X: not configured';
+          el.className = 'text-xs px-2 py-1 rounded-full bg-red-950 text-red-300';
+        }
+      } catch (e) {}
     }
 
     async function loadPosts() {
@@ -181,20 +196,27 @@
 
             <p class="text-sm font-medium leading-snug mb-3 line-clamp-3">${escapeHtml(p.quote || p.content || '')}</p>
 
-            <div class="mt-auto flex flex-wrap gap-2">
-              <button onclick="setImageUrl(${p.id})" class="btn flex-1 py-2 rounded-lg text-xs font-medium border border-cyber-border hover:border-fuchsia-500 hover:text-fuchsia-400">
-                Set URL
-              </button>
-              <button onclick="generateImage(${p.id})" class="btn flex-1 py-2 rounded-lg text-xs font-medium border border-cyber-border hover:border-cyan-500 hover:text-cyan-400">
-                ${p.image_url ? 'API Regen' : 'API Generate'}
-              </button>
-              <select onchange="updateStatus(${p.id}, this.value)" class="bg-cyber-bg border border-cyber-border rounded-lg px-2 py-2 text-xs focus:outline-none">
-                <option value="" disabled selected>Status</option>
-                <option value="draft">Draft</option>
-                <option value="scheduled">Scheduled</option>
-                <option value="posted">Posted</option>
-                <option value="failed">Failed</option>
-              </select>
+            <div class="mt-auto flex flex-col gap-2">
+              <div class="flex flex-wrap gap-2">
+                <button onclick="postToX(${p.id})" class="btn flex-1 py-2 rounded-lg text-xs font-semibold bg-gradient-to-r from-cyan-500 to-fuchsia-500 text-black">
+                  Post to X
+                </button>
+                <button onclick="schedulePost(${p.id})" class="btn flex-1 py-2 rounded-lg text-xs font-medium border border-cyan-700 text-cyan-300 hover:bg-cyan-950">
+                  Schedule
+                </button>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <button onclick="setImageUrl(${p.id})" class="btn flex-1 py-2 rounded-lg text-xs font-medium border border-cyber-border hover:border-fuchsia-500 hover:text-fuchsia-400">
+                  Set URL
+                </button>
+                <select onchange="updateStatus(${p.id}, this.value)" class="bg-cyber-bg border border-cyber-border rounded-lg px-2 py-2 text-xs focus:outline-none">
+                  <option value="" disabled selected>Status</option>
+                  <option value="draft">Draft</option>
+                  <option value="scheduled">Scheduled</option>
+                  <option value="posted">Posted</option>
+                  <option value="failed">Failed</option>
+                </select>
+              </div>
             </div>
           </div>
         </article>
@@ -220,7 +242,7 @@
     }
 
     async function setImageUrl(postId) {
-      const url = prompt('Paste image URL (hosted image, ImgBB, Cloudinary, etc.):');
+      const url = prompt('Paste image URL:');
       if (!url || !url.trim()) return;
       try {
         const res = await fetch(`/posts/${postId}/image-url`, {
@@ -239,16 +261,17 @@
       }
     }
 
-    async function generateImage(postId) {
-      setStatus(`API generate #${postId}...`);
+    async function postToX(postId) {
+      if (!confirm(`Post #${postId} to X right now?`)) return;
+      setStatus(`Posting #${postId} to X...`);
       try {
-        const res = await fetch(`/posts/${postId}/generate-image`, { method: 'POST' });
-        const data = await res.json();
-        if (data.success) {
-          toast(data.source === 'existing' ? `Using existing image #${postId}` : `API image ready #${postId}`, 'success');
+        const res = await fetch(`/posts/${postId}/post-to-x`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.success) {
+          toast(`Posted! tweet id: ${data.tweet_id}${data.media_attached ? ' (with image)' : ' (text only)'}`, 'success');
           loadPosts();
         } else {
-          toast(data.message || 'Generation failed', 'error');
+          toast(data.detail || data.error || 'Post failed', 'error');
         }
       } catch (e) {
         toast('Request failed', 'error');
@@ -256,20 +279,23 @@
       setStatus('');
     }
 
-    async function batchGenerate() {
-      setStatus('Batch API generating...');
-      toast('API: generating for next 5 missing...');
+    async function schedulePost(postId) {
+      setStatus(`Scheduling #${postId}...`);
       try {
-        const res = await fetch('/posts/generate-images', {
+        const res = await fetch(`/posts/${postId}/schedule`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ limit: 5, only_missing: true })
+          body: JSON.stringify({})
         });
-        const data = await res.json();
-        toast(`${data.successful}/${data.processed} done`, data.successful > 0 ? 'success' : 'error');
-        loadPosts();
+        if (res.ok) {
+          toast(`#${postId} scheduled (~1 min)`, 'success');
+          loadPosts();
+        } else {
+          const data = await res.json().catch(() => ({}));
+          toast(data.detail || 'Schedule failed', 'error');
+        }
       } catch (e) {
-        toast('Batch failed', 'error');
+        toast('Request failed', 'error');
       }
       setStatus('');
     }
@@ -291,6 +317,7 @@
       }
     }
 
+    checkX();
     loadPosts();
   </script>
 </body>
