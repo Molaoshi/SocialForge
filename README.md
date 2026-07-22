@@ -4,7 +4,7 @@ AI-Powered Social Media Automation App powered by **Grok 4.5** + **Grok Imagine*
 
 ## Features
 - Topic research + batch content generation
-- Grok Imagine image generation
+- Grok Imagine image generation (wired into the API)
 - Multi-platform posting (X, Instagram, Threads, LinkedIn, Facebook)
 - Scheduling & queue system (APScheduler)
 - FastAPI backend with clean endpoints
@@ -28,6 +28,9 @@ git clone https://github.com/Molaoshi/SocialForge.git
 cd SocialForge
 pip install -r requirements.txt
 
+# Create .env and add your key
+echo "XAI_API_KEY=your_key_here" > .env
+
 # Seed the 50 posts into SQLite
 python seed_db.py
 
@@ -39,15 +42,31 @@ Open http://localhost:8000/docs for interactive API docs.
 
 ## Useful Endpoints
 
-| Method | Endpoint                  | Description                          |
-|--------|---------------------------|--------------------------------------|
-| GET    | `/`                       | Health + available routes            |
-| GET    | `/posts`                  | List posts (filter by status/boldness) |
-| GET    | `/posts/{id}`             | Get single post                      |
-| GET    | `/posts/batch/rejection`  | Raw JSON batch                       |
-| POST   | `/posts/seed`             | Load JSON into database              |
-| PATCH  | `/posts/{id}/status`      | Update status (draft → scheduled → posted) |
-| GET    | `/health`                 | Simple health check                  |
+| Method | Endpoint                       | Description                                      |
+|--------|--------------------------------|--------------------------------------------------|
+| GET    | `/`                            | Health + available routes                        |
+| GET    | `/posts`                       | List posts (filter by status / boldness / has_image) |
+| GET    | `/posts/{id}`                  | Get single post                                  |
+| GET    | `/posts/batch/rejection`       | Raw JSON batch                                   |
+| POST   | `/posts/seed`                  | Load JSON into database                          |
+| PATCH  | `/posts/{id}/status`           | Update status (draft → scheduled → posted)       |
+| **POST** | `/posts/{id}/generate-image` | **Generate image for one post via Grok Imagine** |
+| **POST** | `/posts/generate-images`     | **Batch generate images** (default: first 5 missing) |
+| GET    | `/health`                      | Simple health check                              |
+
+### Example – Generate image for post #1
+
+```bash
+curl -X POST http://localhost:8000/posts/1/generate-image
+```
+
+### Example – Generate images for the next 5 posts that still need one
+
+```bash
+curl -X POST http://localhost:8000/posts/generate-images \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 5, "only_missing": true}'
+```
 
 ## Project Structure
 
@@ -59,15 +78,16 @@ SocialForge/
 ├── models.py                  # SQLAlchemy models (Post)
 ├── seed_db.py                 # One-time seeder for the JSON batch
 ├── content_generator.py       # Load / generate content
-├── imagine.py                 # Grok Imagine stub
+├── imagine.py                 # Grok Imagine integration
 ├── scheduler.py               # APScheduler background jobs
 ├── requirements.txt
-└── .env.example
+├── .env.example
+└── .gitignore
 ```
 
 ## Next Steps
-1. Add real Grok Imagine API calls (xAI key)
-2. Connect platform APIs (X, Meta, LinkedIn)
+1. Test image generation with your real XAI_API_KEY
+2. Connect platform APIs (X first)
 3. Build simple web UI or keep using the API
 4. Deploy to Vercel / Railway / Render
 
