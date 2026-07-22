@@ -8,26 +8,24 @@ from datetime import datetime
 from pathlib import Path
 
 from models import init_db, get_db, Post
-from content_generator import get_rejection_batch, load_posts_from_json
+from content_generator import load_posts_from_json
 from imagine import generate_image
 
 app = FastAPI(
     title="SocialForge",
     description="AI-Powered Social Media Automation with Grok 4.5 + Grok Imagine",
-    version="0.4.0",
+    version="0.5.0",
 )
 
-# Serve the UI
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-# Initialize DB on startup
 @app.on_event("startup")
 def startup():
     init_db()
 
-# ---------- Pydantic schemas ----------
+# ---------- Schemas ----------
 class PostOut(BaseModel):
     id: int
     external_id: Optional[int]
@@ -49,37 +47,34 @@ class PostOut(BaseModel):
 class StatusUpdate(BaseModel):
     status: str
 
+class ImageUrlUpdate(BaseModel):
+    image_url: str
+
 class GenerateImageResponse(BaseModel):
     post_id: int
     image_url: Optional[str]
     success: bool
     message: str
+    source: str = "api"  # api | existing | json
 
 class BatchGenerateRequest(BaseModel):
     limit: int = 5
     only_missing: bool = True
+    force: bool = False  # if True, regenerate even when image_url exists
 
 # ---------- UI ----------
 @app.get("/")
 def ui():
-    """Serve the main UI."""
     index = static_dir / "index.html"
     if index.exists():
         return FileResponse(index)
-    return {
-        "message": "SocialForge API is running (UI not found)",
-        "docs": "/docs",
-    }
+    return {"message": "SocialForge API is running (UI not found)", "docs": "/docs"}
 
-# ---------- API Routes ----------
 @app.get("/api")
 def api_root():
-    return {
-        "message": "SocialForge API",
-        "version": "0.4.0",
-        "docs": "/docs",
-    }
+    return {"message": "SocialForge API", "version": "0.5.0", "docs": "/docs"}
 
+# ---------- Posts ----------
 @app.get("/posts", response_model=List[PostOut])
 def list_posts(
     status: Optional[str] = Query(None),
@@ -113,9 +108,14 @@ def get_rejection_json():
 @app.post("/posts/seed")
 def seed_posts(db: Session = Depends(get_db)):
     from seed_db import seed_rejection_posts
-    seed_rejection_posts()
+    seed_rejection_posts(update_existing=True)
     count = db.query(Post).count()
-    return {"message": "Seed complete", "total_posts_in_db": count}
+    with_images = db.query(Post).filter(Post.image_url.isnot(None)).count()
+    return {
+        "message": "Seed complete",
+        "total_posts_in_db": count,
+        "posts_with_images": with_images,
+    }
 
 @app.patch("/posts/{post_id}/status", response_model=PostOut)
 def update_status(post_id: int, body: StatusUpdate, db: Session = Depends(get_db)):
@@ -129,11 +129,38 @@ def update_status(post_id: int, body: StatusUpdate, db: Session = Depends(get_db
     db.refresh(post)
     return post
 
-@app.post("/posts/{post_id}/generate-image", response_model=GenerateImageResponse)
-def generate_post_image(post_id: int, db: Session = Depends(get_db)):
+@app.patch("/posts/{post_id}/image-url", response_model=PostOut)
+def set_image_url(post_id: int, body: ImageUrlUpdate, db: Session = Depends(get_db)):
+    """Manually set / override the image URL for a post (no API call)."""
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
+    post.image_url = body.image_url
+    db.commit()
+    db.refresh(post)
+    return post
+
+# ---------- Image generation (API only when needed) ----------
+@app.post("/posts/{post_id}/generate-image", response_model=GenerateImageResponse)
+def generate_post_image(
+    post_id: int,
+    force: bool = Query(False, description="Regenerate even if image_url already exists"),
+    db: Session = Depends(get_db),
+):
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    # Prefer existing URL — no API call
+    if post.image_url and not force:
+        return GenerateImageResponse(
+            post_id=post.id,
+            image_url=post.image_url,
+            success=True,
+            message="Using existing image_url (no API call)",
+            source="existing",
+        )
+
     if not post.image_prompt:
         raise HTTPException(status_code=400, detail="Post has no image_prompt")
 
@@ -147,19 +174,22 @@ def generate_post_image(post_id: int, db: Session = Depends(get_db)):
             post_id=post.id,
             image_url=image_url,
             success=True,
-            message="Image generated and saved",
+            message="Image generated via xAI API",
+            source="api",
         )
+
     return GenerateImageResponse(
         post_id=post.id,
-        image_url=None,
+        image_url=post.image_url,
         success=False,
-        message="Image generation failed. Check logs / API key / model name.",
+        message="API generation failed. Set image_url manually or add credits at console.x.ai",
+        source="api",
     )
 
 @app.post("/posts/generate-images")
 def generate_images_batch(body: BatchGenerateRequest, db: Session = Depends(get_db)):
     query = db.query(Post)
-    if body.only_missing:
+    if body.only_missing and not body.force:
         query = query.filter(Post.image_url.is_(None))
     posts = query.order_by(Post.external_id).limit(body.limit).all()
 
@@ -168,6 +198,16 @@ def generate_images_batch(body: BatchGenerateRequest, db: Session = Depends(get_
 
     results = []
     for post in posts:
+        # Prefer existing
+        if post.image_url and not body.force:
+            results.append({
+                "post_id": post.id,
+                "success": True,
+                "image_url": post.image_url,
+                "source": "existing",
+            })
+            continue
+
         if not post.image_prompt:
             results.append({"post_id": post.id, "success": False, "message": "No image_prompt"})
             continue
@@ -175,9 +215,19 @@ def generate_images_batch(body: BatchGenerateRequest, db: Session = Depends(get_
         image_url = generate_image(post.image_prompt)
         if image_url:
             post.image_url = image_url
-            results.append({"post_id": post.id, "success": True, "image_url": image_url})
+            results.append({
+                "post_id": post.id,
+                "success": True,
+                "image_url": image_url,
+                "source": "api",
+            })
         else:
-            results.append({"post_id": post.id, "success": False, "message": "Generation failed"})
+            results.append({
+                "post_id": post.id,
+                "success": False,
+                "message": "API generation failed",
+                "source": "api",
+            })
 
     db.commit()
     success_count = sum(1 for r in results if r.get("success"))
