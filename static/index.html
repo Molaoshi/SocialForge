@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SocialForge</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            cyber: {
+              bg: '#0a0a0f',
+              card: '#12121a',
+              border: '#1e1e2e',
+              cyan: '#00f0ff',
+              magenta: '#ff00aa',
+              purple: '#a855f7',
+            }
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+            sans: ['Inter', 'system-ui', 'sans-serif']
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    body { background: #0a0a0f; }
+    .glow-cyan { box-shadow: 0 0 20px rgba(0, 240, 255, 0.15); }
+    .glow-magenta { box-shadow: 0 0 20px rgba(255, 0, 170, 0.15); }
+    .card-hover:hover { border-color: #00f0ff55; transform: translateY(-2px); }
+    .btn { transition: all 0.2s; }
+    .btn:active { transform: scale(0.97); }
+    .status-draft { background: #334155; color: #94a3b8; }
+    .status-scheduled { background: #1e3a5f; color: #38bdf8; }
+    .status-posted { background: #14532d; color: #4ade80; }
+    .status-failed { background: #450a0a; color: #f87171; }
+    .boldness-mild { color: #67e8f9; }
+    .boldness-medium { color: #c084fc; }
+    .boldness-high { color: #f472b6; }
+    ::-webkit-scrollbar { width: 8px; }
+    ::-webkit-scrollbar-track { background: #0a0a0f; }
+    ::-webkit-scrollbar-thumb { background: #1e1e2e; border-radius: 4px; }
+  </style>
+</head>
+<body class="text-gray-100 font-sans min-h-screen">
+
+  <!-- Header -->
+  <header class="border-b border-cyber-border bg-cyber-card/80 backdrop-blur sticky top-0 z-50">
+    <div class="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-cyan-400 to-fuchsia-500 flex items-center justify-center font-bold text-black text-lg">S</div>
+        <div>
+          <h1 class="text-xl font-bold tracking-tight">SocialForge</h1>
+          <p class="text-xs text-gray-500">Grok 4.5 + Imagine</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3">
+        <span id="db-count" class="text-sm text-gray-400">— posts</span>
+        <button onclick="seedPosts()" class="btn px-4 py-2 rounded-lg bg-cyber-border hover:bg-cyber-border/80 text-sm font-medium">
+          Seed DB
+        </button>
+        <button onclick="batchGenerate()" class="btn px-4 py-2 rounded-lg bg-gradient-to-r from-cyan-500 to-fuchsia-500 text-black font-semibold text-sm glow-cyan">
+          Generate Images
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Filters -->
+  <div class="max-w-7xl mx-auto px-4 py-6">
+    <div class="flex flex-wrap gap-3 items-center">
+      <select id="filter-status" onchange="loadPosts()" class="bg-cyber-card border border-cyber-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
+        <option value="">All statuses</option>
+        <option value="draft">Draft</option>
+        <option value="scheduled">Scheduled</option>
+        <option value="posted">Posted</option>
+        <option value="failed">Failed</option>
+      </select>
+      <select id="filter-boldness" onchange="loadPosts()" class="bg-cyber-card border border-cyber-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
+        <option value="">All boldness</option>
+        <option value="mild">Mild</option>
+        <option value="medium">Medium</option>
+        <option value="high">High</option>
+      </select>
+      <select id="filter-image" onchange="loadPosts()" class="bg-cyber-card border border-cyber-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-cyan-500">
+        <option value="">All images</option>
+        <option value="false">Missing image</option>
+        <option value="true">Has image</option>
+      </select>
+      <button onclick="loadPosts()" class="btn px-4 py-2 rounded-lg border border-cyber-border hover:border-cyan-500 text-sm">
+        Refresh
+      </button>
+      <div id="status-msg" class="ml-auto text-sm text-gray-400"></div>
+    </div>
+  </div>
+
+  <!-- Posts Grid -->
+  <main class="max-w-7xl mx-auto px-4 pb-16">
+    <div id="posts-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+      <!-- Cards injected here -->
+    </div>
+    <div id="empty-state" class="hidden text-center py-20 text-gray-500">
+      <p class="text-lg mb-2">No posts yet</p>
+      <p class="text-sm">Click <strong>Seed DB</strong> to load the 50 rejection posts</p>
+    </div>
+  </main>
+
+  <!-- Toast -->
+  <div id="toast" class="fixed bottom-6 right-6 px-5 py-3 rounded-xl bg-cyber-card border border-cyber-border shadow-xl text-sm opacity-0 transition-opacity duration-300 pointer-events-none z-50"></div>
+
+  <script>
+    const API = '';  // same origin
+
+    function toast(msg, type = 'info') {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.className = `fixed bottom-6 right-6 px-5 py-3 rounded-xl border shadow-xl text-sm z-50 transition-opacity duration-300 ${
+        type === 'error' ? 'bg-red-950 border-red-700 text-red-200' :
+        type === 'success' ? 'bg-emerald-950 border-emerald-700 text-emerald-200' :
+        'bg-cyber-card border-cyber-border text-gray-200'
+      }`;
+      el.style.opacity = '1';
+      setTimeout(() => el.style.opacity = '0', 3500);
+    }
+
+    function setStatus(msg) {
+      document.getElementById('status-msg').textContent = msg;
+    }
+
+    async function loadPosts() {
+      const status = document.getElementById('filter-status').value;
+      const boldness = document.getElementById('filter-boldness').value;
+      const hasImage = document.getElementById('filter-image').value;
+
+      let url = `/posts?limit=100`;
+      if (status) url += `&status=${status}`;
+      if (boldness) url += `&boldness=${boldness}`;
+      if (hasImage !== '') url += `&has_image=${hasImage}`;
+
+      setStatus('Loading...');
+      try {
+        const res = await fetch(url);
+        const posts = await res.json();
+        renderPosts(posts);
+        document.getElementById('db-count').textContent = `${posts.length} posts`;
+        setStatus('');
+      } catch (e) {
+        toast('Failed to load posts', 'error');
+        setStatus('Error');
+      }
+    }
+
+    function renderPosts(posts) {
+      const grid = document.getElementById('posts-grid');
+      const empty = document.getElementById('empty-state');
+
+      if (!posts || posts.length === 0) {
+        grid.innerHTML = '';
+        empty.classList.remove('hidden');
+        return;
+      }
+      empty.classList.add('hidden');
+
+      grid.innerHTML = posts.map(p => `
+        <article class="card-hover bg-cyber-card border border-cyber-border rounded-2xl overflow-hidden transition-all duration-200 flex flex-col">
+          ${p.image_url ? `
+            <div class="aspect-[4/5] bg-black relative overflow-hidden">
+              <img src="${p.image_url}" alt="Generated" class="w-full h-full object-cover" onerror="this.parentElement.innerHTML='<div class=\'flex items-center justify-center h-full text-gray-600 text-sm\'>Image unavailable</div>'" />
+            </div>
+          ` : `
+            <div class="aspect-[4/5] bg-gradient-to-br from-gray-900 to-black flex items-center justify-center border-b border-cyber-border">
+              <div class="text-center px-4">
+                <div class="text-4xl mb-2 opacity-30">✦</div>
+                <p class="text-xs text-gray-600">No image yet</p>
+              </div>
+            </div>
+          `}
+
+          <div class="p-4 flex flex-col flex-1">
+            <div class="flex items-center gap-2 mb-2">
+              <span class="text-xs px-2 py-0.5 rounded-full status-${p.status}">${p.status}</span>
+              <span class="text-xs boldness-${p.boldness || 'medium'}">${p.boldness || '—'}</span>
+              <span class="text-xs text-gray-600 ml-auto">#${p.external_id || p.id}</span>
+            </div>
+
+            <p class="text-sm font-medium leading-snug mb-3 line-clamp-3">${escapeHtml(p.quote || p.content || '')}</p>
+
+            <div class="mt-auto flex gap-2">
+              <button onclick="generateImage(${p.id})" class="btn flex-1 py-2 rounded-lg text-xs font-medium border border-cyber-border hover:border-cyan-500 hover:text-cyan-400">
+                ${p.image_url ? 'Regenerate' : 'Generate Image'}
+              </button>
+              <select onchange="updateStatus(${p.id}, this.value)" class="bg-cyber-bg border border-cyber-border rounded-lg px-2 py-2 text-xs focus:outline-none">
+                <option value="" disabled selected>Status</option>
+                <option value="draft">Draft</option>
+                <option value="scheduled">Scheduled</option>
+                <option value="posted">Posted</option>
+                <option value="failed">Failed</option>
+              </select>
+            </div>
+          </div>
+        </article>
+      `).join('');
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    async function seedPosts() {
+      setStatus('Seeding...');
+      try {
+        const res = await fetch('/posts/seed', { method: 'POST' });
+        const data = await res.json();
+        toast(`Seeded — ${data.total_posts_in_db} posts in DB`, 'success');
+        loadPosts();
+      } catch (e) {
+        toast('Seed failed', 'error');
+      }
+    }
+
+    async function generateImage(postId) {
+      setStatus(`Generating image for #${postId}...`);
+      toast(`Generating image for post #${postId}...`);
+      try {
+        const res = await fetch(`/posts/${postId}/generate-image`, { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          toast(`Image ready for #${postId}`, 'success');
+          loadPosts();
+        } else {
+          toast(data.message || 'Generation failed', 'error');
+        }
+      } catch (e) {
+        toast('Request failed', 'error');
+      }
+      setStatus('');
+    }
+
+    async function batchGenerate() {
+      setStatus('Batch generating...');
+      toast('Generating images for next 5 posts...');
+      try {
+        const res = await fetch('/posts/generate-images', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ limit: 5, only_missing: true })
+        });
+        const data = await res.json();
+        toast(`${data.successful}/${data.processed} images generated`, data.successful > 0 ? 'success' : 'error');
+        loadPosts();
+      } catch (e) {
+        toast('Batch failed', 'error');
+      }
+      setStatus('');
+    }
+
+    async function updateStatus(postId, status) {
+      if (!status) return;
+      try {
+        const res = await fetch(`/posts/${postId}/status`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status })
+        });
+        if (res.ok) {
+          toast(`Post #${postId} → ${status}`, 'success');
+          loadPosts();
+        }
+      } catch (e) {
+        toast('Status update failed', 'error');
+      }
+    }
+
+    // Init
+    loadPosts();
+  </script>
+</body>
+</html>
