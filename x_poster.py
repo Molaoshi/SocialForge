@@ -1,14 +1,8 @@
 """
 Post to X (Twitter) using OAuth 2.0 user access token.
 
-Env vars required:
-  X_ACCESS_TOKEN       - OAuth 2.0 user access token (tweet.write)
-  X_REFRESH_TOKEN      - optional, for token refresh
-  X_CLIENT_ID          - for refresh
-  X_CLIENT_SECRET      - for refresh
-
-Optional (legacy OAuth 1.0a, not required for text posts):
-  X_API_KEY, X_API_KEY_SECRET, X_ACCESS_TOKEN_SECRET
+Env vars:
+  X_ACCESS_TOKEN, X_REFRESH_TOKEN, X_CLIENT_ID, X_CLIENT_SECRET
 """
 from __future__ import annotations
 
@@ -31,7 +25,6 @@ def _access_token() -> Optional[str]:
 
 
 def refresh_access_token() -> Optional[str]:
-    """Refresh OAuth 2.0 access token using refresh_token."""
     refresh = os.getenv("X_REFRESH_TOKEN")
     client_id = os.getenv("X_CLIENT_ID")
     client_secret = os.getenv("X_CLIENT_SECRET")
@@ -43,9 +36,7 @@ def refresh_access_token() -> Optional[str]:
         "refresh_token": refresh,
         "client_id": client_id,
     }
-    auth = None
-    if client_secret:
-        auth = (client_id, client_secret)
+    auth = (client_id, client_secret) if client_secret else None
 
     try:
         with httpx.Client(timeout=20.0) as client:
@@ -76,28 +67,86 @@ def _auth_headers(token: Optional[str] = None) -> dict:
     }
 
 
-def upload_image_bytes(image_bytes: bytes, media_type: str = "image/jpeg") -> Optional[str]:
+def _normalize_media_type(ctype: str) -> str:
+    ctype = (ctype or "image/jpeg").split(";")[0].strip().lower()
+    mapping = {
+        "image/jpg": "image/jpeg",
+        "image/pjpeg": "image/jpeg",
+        "image/x-png": "image/png",
+    }
+    return mapping.get(ctype, ctype if ctype.startswith("image/") else "image/jpeg")
+
+
+def upload_image_bytes(image_bytes: bytes, media_type: str = "image/jpeg") -> tuple[Optional[str], str]:
     """
-    Upload image via X API v2 media endpoint.
-    Returns media_id string, or None on failure.
-    Requires tweet.write + ideally media.write scope on the token.
+    Upload image via X API v2.
+    Returns (media_id, error_message).
+    Tries multipart first (most reliable), then JSON base64.
     """
     token = _access_token()
     if not token:
-        return None
+        return None, "X_ACCESS_TOKEN not set"
 
-    # v2 simple-ish upload: send base64 media in JSON (for smaller images)
-    # Fallback path uses multipart if needed.
-    b64 = base64.b64encode(image_bytes).decode("ascii")
+    if not image_bytes or len(image_bytes) < 100:
+        return None, "Image bytes empty or too small"
 
-    payload = {
-        "media": b64,
-        "media_category": "tweet_image",
-        "media_type": media_type,
-    }
+    if len(image_bytes) > 5 * 1024 * 1024:
+        return None, f"Image too large ({len(image_bytes)} bytes). Max 5MB."
 
+    media_type = _normalize_media_type(media_type)
+    ext = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+    }.get(media_type, "jpg")
+
+    errors = []
+
+    # --- Method 1: multipart/form-data (official curl style) ---
     try:
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=90.0) as client:
+            files = {
+                "media": (f"image.{ext}", image_bytes, media_type),
+            }
+            data = {
+                "media_category": "tweet_image",
+                "media_type": media_type,
+            }
+            headers = {"Authorization": f"Bearer {token}"}
+            r = client.post(MEDIA_UPLOAD_URL, headers=headers, data=data, files=files)
+
+            if r.status_code in (401, 403):
+                new_t = refresh_access_token()
+                if new_t:
+                    headers = {"Authorization": f"Bearer {new_t}"}
+                    r = client.post(MEDIA_UPLOAD_URL, headers=headers, data=data, files=files)
+
+            if r.status_code in (200, 201):
+                payload = r.json()
+                media_id = (
+                    (payload.get("data") or {}).get("id")
+                    or (payload.get("data") or {}).get("media_id")
+                    or payload.get("media_id")
+                    or payload.get("id")
+                )
+                if media_id:
+                    return str(media_id), ""
+                errors.append(f"multipart ok but no media_id: {str(payload)[:200]}")
+            else:
+                errors.append(f"multipart {r.status_code}: {r.text[:250]}")
+    except Exception as e:
+        errors.append(f"multipart exception: {e}")
+
+    # --- Method 2: JSON + base64 ---
+    try:
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        payload = {
+            "media": b64,
+            "media_category": "tweet_image",
+            "media_type": media_type,
+        }
+        with httpx.Client(timeout=90.0) as client:
             r = client.post(
                 MEDIA_UPLOAD_URL,
                 headers={
@@ -107,7 +156,6 @@ def upload_image_bytes(image_bytes: bytes, media_type: str = "image/jpeg") -> Op
                 json=payload,
             )
             if r.status_code in (401, 403):
-                # try refresh once
                 new_t = refresh_access_token()
                 if new_t:
                     r = client.post(
@@ -118,42 +166,44 @@ def upload_image_bytes(image_bytes: bytes, media_type: str = "image/jpeg") -> Op
                         },
                         json=payload,
                     )
-
-            if r.status_code not in (200, 201):
-                log.error("Media upload failed: %s %s", r.status_code, r.text[:400])
-                return None
-
-            data = r.json()
-            # Response shapes vary; try common fields
-            media_id = (
-                data.get("data", {}).get("id")
-                or data.get("data", {}).get("media_id")
-                or data.get("media_id")
-                or data.get("id")
-            )
-            if media_id is not None:
-                return str(media_id)
-            log.error("Media upload: no media_id in response: %s", data)
-            return None
+            if r.status_code in (200, 201):
+                body = r.json()
+                media_id = (
+                    (body.get("data") or {}).get("id")
+                    or (body.get("data") or {}).get("media_id")
+                    or body.get("media_id")
+                    or body.get("id")
+                )
+                if media_id:
+                    return str(media_id), ""
+                errors.append(f"json ok but no media_id: {str(body)[:200]}")
+            else:
+                errors.append(f"json {r.status_code}: {r.text[:250]}")
     except Exception as e:
-        log.error("Media upload exception: %s", e)
-        return None
+        errors.append(f"json exception: {e}")
+
+    return None, " | ".join(errors)
 
 
-def download_image(url: str) -> Optional[tuple[bytes, str]]:
-    """Download image bytes from a URL (Drive proxy or external)."""
+def download_image(url: str) -> tuple[Optional[bytes], str, str]:
+    """
+    Download image. Returns (bytes, content_type, error).
+    """
+    if not url:
+        return None, "", "No image URL"
     try:
-        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-            r = client.get(url)
-            if r.status_code != 200 or len(r.content) < 500:
-                return None
+        with httpx.Client(timeout=45.0, follow_redirects=True) as client:
+            r = client.get(url, headers={"User-Agent": "SocialForge/0.7"})
+            if r.status_code != 200:
+                return None, "", f"Download HTTP {r.status_code} for {url[:80]}"
+            if len(r.content) < 500:
+                return None, "", f"Downloaded file too small ({len(r.content)} bytes)"
             ctype = r.headers.get("content-type", "image/jpeg").split(";")[0]
-            if "html" in ctype:
-                return None
-            return r.content, ctype
+            if "html" in ctype.lower() or "text/" in ctype.lower():
+                return None, "", f"Got {ctype} instead of image from {url[:80]}"
+            return r.content, ctype, ""
     except Exception as e:
-        log.error("Image download failed: %s", e)
-        return None
+        return None, "", f"Download error: {e}"
 
 
 def post_tweet(
@@ -163,10 +213,8 @@ def post_tweet(
     base_url: Optional[str] = None,
 ) -> dict:
     """
-    Post a tweet. Optionally attach an image from image_url.
-
-    Returns dict:
-      { success, tweet_id?, text?, error?, media_attached? }
+    Post a tweet, optionally with image.
+    Returns { success, tweet_id?, media_attached?, media_error?, error? }
     """
     token = _access_token()
     if not token:
@@ -174,26 +222,31 @@ def post_tweet(
 
     media_ids = []
     media_attached = False
+    media_error = ""
 
     if image_url:
-        # Resolve relative proxy URLs against app base
         fetch_url = image_url
         if image_url.startswith("/") and base_url:
             fetch_url = base_url.rstrip("/") + image_url
+        elif image_url.startswith("/") and not base_url:
+            media_error = "APP_BASE_URL not set — cannot resolve relative image path"
+            log.warning(media_error)
 
-        downloaded = download_image(fetch_url)
-        if downloaded:
-            img_bytes, ctype = downloaded
-            media_id = upload_image_bytes(img_bytes, media_type=ctype or "image/jpeg")
-            if media_id:
-                media_ids.append(media_id)
-                media_attached = True
+        if not media_error:
+            img_bytes, ctype, dl_err = download_image(fetch_url)
+            if dl_err:
+                media_error = dl_err
+                log.warning("Image download failed: %s", dl_err)
             else:
-                log.warning("Image upload failed — posting text only")
-        else:
-            log.warning("Could not download image from %s — posting text only", image_url)
+                media_id, up_err = upload_image_bytes(img_bytes, media_type=ctype or "image/jpeg")
+                if media_id:
+                    media_ids.append(media_id)
+                    media_attached = True
+                else:
+                    media_error = up_err or "Media upload failed"
+                    log.warning("Image upload failed: %s", media_error)
 
-    body: dict = {"text": text[:280]}  # hard cap
+    body: dict = {"text": text[:280]}
     if media_ids:
         body["media"] = {"media_ids": media_ids}
 
@@ -218,6 +271,7 @@ def post_tweet(
                     "success": False,
                     "error": f"X API {r.status_code}: {r.text[:400]}",
                     "media_attached": media_attached,
+                    "media_error": media_error,
                 }
 
             data = r.json().get("data", {})
@@ -226,9 +280,15 @@ def post_tweet(
                 "tweet_id": data.get("id"),
                 "text": data.get("text"),
                 "media_attached": media_attached,
+                "media_error": media_error,
             }
     except Exception as e:
-        return {"success": False, "error": str(e), "media_attached": media_attached}
+        return {
+            "success": False,
+            "error": str(e),
+            "media_attached": media_attached,
+            "media_error": media_error,
+        }
 
 
 def is_configured() -> bool:
