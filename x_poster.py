@@ -1,8 +1,11 @@
 """
-Post to X using OAuth 2.0 user access token + automatic refresh.
+Post to X using OAuth 2.0 (text) + OAuth 1.0a (media when available).
 
-Required env:
-  X_ACCESS_TOKEN, X_REFRESH_TOKEN, X_CLIENT_ID, X_CLIENT_SECRET
+Env:
+  OAuth 2.0: X_ACCESS_TOKEN, X_REFRESH_TOKEN, X_CLIENT_ID, X_CLIENT_SECRET
+  OAuth 1.0a (for images): X_API_KEY, X_API_KEY_SECRET (or X_API_SECRET),
+                           X_ACCESS_TOKEN_OAUTH1, X_ACCESS_TOKEN_SECRET
+                           (or X_ACCESS_TOKEN_SECRET alone with OAuth1 user tokens)
 """
 from __future__ import annotations
 
@@ -18,13 +21,13 @@ import httpx
 log = logging.getLogger("x_poster")
 
 X_API_BASE = "https://api.x.com/2"
-MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
+MEDIA_UPLOAD_V2 = "https://api.x.com/2/media/upload"
+MEDIA_UPLOAD_V11 = "https://upload.twitter.com/1.1/media/upload.json"
 TOKEN_URL = "https://api.x.com/2/oauth2/token"
 TOKEN_FILE = Path(__file__).parent / "data" / "x_tokens.json"
 
 
 def _load_persisted_tokens() -> None:
-    """Load last refreshed tokens from disk into env (survives within same deploy)."""
     try:
         if TOKEN_FILE.exists():
             data = json.loads(TOKEN_FILE.read_text())
@@ -60,7 +63,6 @@ def _persist_tokens(access: Optional[str], refresh: Optional[str]) -> None:
             os.environ["X_REFRESH_TOKEN"] = refresh
 
 
-# Load any previously refreshed tokens on import
 _load_persisted_tokens()
 
 
@@ -68,12 +70,35 @@ def _access_token() -> Optional[str]:
     return os.getenv("X_ACCESS_TOKEN") or os.getenv("X_USER_ACCESS_TOKEN")
 
 
+def _api_key() -> Optional[str]:
+    return os.getenv("X_API_KEY") or os.getenv("X_CONSUMER_KEY")
+
+
+def _api_secret() -> Optional[str]:
+    return (
+        os.getenv("X_API_KEY_SECRET")
+        or os.getenv("X_API_SECRET")
+        or os.getenv("X_CONSUMER_SECRET")
+    )
+
+
+def _oauth1_access_token() -> Optional[str]:
+    return os.getenv("X_ACCESS_TOKEN_OAUTH1") or os.getenv("X_OAUTH1_ACCESS_TOKEN")
+
+
+def _oauth1_access_secret() -> Optional[str]:
+    return (
+        os.getenv("X_ACCESS_TOKEN_SECRET")
+        or os.getenv("X_OAUTH1_ACCESS_TOKEN_SECRET")
+        or os.getenv("X_ACCESS_TOKEN_S")
+    )
+
+
+def oauth1_media_ready() -> bool:
+    return bool(_api_key() and _api_secret() and _oauth1_access_token() and _oauth1_access_secret())
+
+
 def refresh_access_token() -> tuple[Optional[str], str]:
-    """
-    Refresh OAuth 2.0 access token.
-    Tries confidential client (Basic auth) then public client (client_id in body).
-    Returns (new_access_token, error_message).
-    """
     refresh = os.getenv("X_REFRESH_TOKEN")
     client_id = os.getenv("X_CLIENT_ID")
     client_secret = os.getenv("X_CLIENT_SECRET")
@@ -85,7 +110,6 @@ def refresh_access_token() -> tuple[Optional[str], str]:
 
     errors = []
 
-    # --- Confidential client: Basic auth, no client_id in body ---
     if client_secret:
         try:
             basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
@@ -96,10 +120,7 @@ def refresh_access_token() -> tuple[Optional[str], str]:
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Authorization": f"Basic {basic}",
                     },
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh,
-                    },
+                    data={"grant_type": "refresh_token", "refresh_token": refresh},
                 )
                 if r.status_code == 200:
                     payload = r.json()
@@ -107,7 +128,6 @@ def refresh_access_token() -> tuple[Optional[str], str]:
                     new_refresh = payload.get("refresh_token")
                     if new_access:
                         _persist_tokens(new_access, new_refresh)
-                        log.info("Token refreshed (confidential client)")
                         return new_access, ""
                     errors.append("confidential: 200 but no access_token")
                 else:
@@ -115,7 +135,6 @@ def refresh_access_token() -> tuple[Optional[str], str]:
         except Exception as e:
             errors.append(f"confidential exception: {e}")
 
-    # --- Public client: client_id in body ---
     try:
         with httpx.Client(timeout=20.0) as client:
             r = client.post(
@@ -133,7 +152,6 @@ def refresh_access_token() -> tuple[Optional[str], str]:
                 new_refresh = payload.get("refresh_token")
                 if new_access:
                     _persist_tokens(new_access, new_refresh)
-                    log.info("Token refreshed (public client)")
                     return new_access, ""
                 errors.append("public: 200 but no access_token")
             else:
@@ -145,12 +163,8 @@ def refresh_access_token() -> tuple[Optional[str], str]:
 
 
 def ensure_access_token() -> tuple[Optional[str], str]:
-    """
-    Return a usable access token. On failure, try refresh first.
-    """
     token = _access_token()
     if not token:
-        # try refresh from refresh_token alone
         new_t, err = refresh_access_token()
         if new_t:
             return new_t, ""
@@ -162,56 +176,61 @@ def _auth_headers(token: Optional[str] = None) -> dict:
     t = token or _access_token()
     if not t:
         raise RuntimeError("X_ACCESS_TOKEN not set")
-    return {
-        "Authorization": f"Bearer {t}",
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
 
 
 def _normalize_media_type(ctype: str) -> str:
     ctype = (ctype or "image/jpeg").split(";")[0].strip().lower()
-    mapping = {
-        "image/jpg": "image/jpeg",
-        "image/pjpeg": "image/jpeg",
-        "image/x-png": "image/png",
-    }
+    mapping = {"image/jpg": "image/jpeg", "image/pjpeg": "image/jpeg", "image/x-png": "image/png"}
     return mapping.get(ctype, ctype if ctype.startswith("image/") else "image/jpeg")
 
 
-def upload_image_bytes(image_bytes: bytes, media_type: str = "image/jpeg") -> tuple[Optional[str], str]:
-    token, tok_err = ensure_access_token()
-    if not token:
-        return None, tok_err or "No access token"
+def _upload_oauth1_v11(image_bytes: bytes) -> tuple[Optional[str], str]:
+    """Upload via legacy v1.1 endpoint with OAuth 1.0a user context."""
+    if not oauth1_media_ready():
+        return None, "OAuth1 not configured (need X_API_KEY, X_API_KEY_SECRET, X_ACCESS_TOKEN_OAUTH1, X_ACCESS_TOKEN_SECRET)"
 
-    if not image_bytes or len(image_bytes) < 100:
-        return None, "Image bytes empty or too small"
-    if len(image_bytes) > 5 * 1024 * 1024:
-        return None, f"Image too large ({len(image_bytes)} bytes). Max 5MB."
+    try:
+        from requests_oauthlib import OAuth1Session
 
+        session = OAuth1Session(
+            client_key=_api_key(),
+            client_secret=_api_secret(),
+            resource_owner_key=_oauth1_access_token(),
+            resource_owner_secret=_oauth1_access_secret(),
+        )
+        r = session.post(
+            MEDIA_UPLOAD_V11,
+            files={"media": image_bytes},
+            timeout=90,
+        )
+        if r.status_code not in (200, 201):
+            return None, f"oauth1/v1.1 {r.status_code}: {r.text[:250]}"
+        data = r.json()
+        media_id = data.get("media_id_string") or data.get("media_id")
+        if media_id:
+            return str(media_id), ""
+        return None, f"oauth1/v1.1 no media_id: {str(data)[:200]}"
+    except Exception as e:
+        return None, f"oauth1/v1.1 exception: {e}"
+
+
+def _upload_oauth2_v2(image_bytes: bytes, media_type: str, token: str) -> tuple[Optional[str], str]:
     media_type = _normalize_media_type(media_type)
-    ext = {
-        "image/jpeg": "jpg",
-        "image/png": "png",
-        "image/webp": "webp",
-        "image/gif": "gif",
-    }.get(media_type, "jpg")
-
+    ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}.get(media_type, "jpg")
     errors = []
 
-    # Multipart (preferred)
     try:
         with httpx.Client(timeout=90.0) as client:
             files = {"media": (f"image.{ext}", image_bytes, media_type)}
             data = {"media_category": "tweet_image", "media_type": media_type}
             headers = {"Authorization": f"Bearer {token}"}
-            r = client.post(MEDIA_UPLOAD_URL, headers=headers, data=data, files=files)
-
+            r = client.post(MEDIA_UPLOAD_V2, headers=headers, data=data, files=files)
             if r.status_code in (401, 403):
                 new_t, _ = refresh_access_token()
                 if new_t:
                     headers = {"Authorization": f"Bearer {new_t}"}
-                    r = client.post(MEDIA_UPLOAD_URL, headers=headers, data=data, files=files)
-
+                    r = client.post(MEDIA_UPLOAD_V2, headers=headers, data=data, files=files)
             if r.status_code in (200, 201):
                 payload = r.json()
                 media_id = (
@@ -228,32 +247,21 @@ def upload_image_bytes(image_bytes: bytes, media_type: str = "image/jpeg") -> tu
     except Exception as e:
         errors.append(f"multipart exception: {e}")
 
-    # JSON base64 fallback
     try:
         b64 = base64.b64encode(image_bytes).decode("ascii")
-        payload = {
-            "media": b64,
-            "media_category": "tweet_image",
-            "media_type": media_type,
-        }
+        payload = {"media": b64, "media_category": "tweet_image", "media_type": media_type}
         with httpx.Client(timeout=90.0) as client:
             r = client.post(
-                MEDIA_UPLOAD_URL,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
+                MEDIA_UPLOAD_V2,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                 json=payload,
             )
             if r.status_code in (401, 403):
                 new_t, _ = refresh_access_token()
                 if new_t:
                     r = client.post(
-                        MEDIA_UPLOAD_URL,
-                        headers={
-                            "Authorization": f"Bearer {new_t}",
-                            "Content-Type": "application/json",
-                        },
+                        MEDIA_UPLOAD_V2,
+                        headers={"Authorization": f"Bearer {new_t}", "Content-Type": "application/json"},
                         json=payload,
                     )
             if r.status_code in (200, 201):
@@ -271,6 +279,36 @@ def upload_image_bytes(image_bytes: bytes, media_type: str = "image/jpeg") -> tu
                 errors.append(f"json {r.status_code}: {r.text[:250]}")
     except Exception as e:
         errors.append(f"json exception: {e}")
+
+    return None, " | ".join(errors)
+
+
+def upload_image_bytes(image_bytes: bytes, media_type: str = "image/jpeg") -> tuple[Optional[str], str]:
+    if not image_bytes or len(image_bytes) < 100:
+        return None, "Image bytes empty or too small"
+    if len(image_bytes) > 5 * 1024 * 1024:
+        return None, f"Image too large ({len(image_bytes)} bytes). Max 5MB."
+
+    errors = []
+
+    # 1) OAuth 1.0a v1.1 (best chance for accounts without media.write)
+    if oauth1_media_ready():
+        mid, err = _upload_oauth1_v11(image_bytes)
+        if mid:
+            return mid, ""
+        errors.append(err)
+    else:
+        errors.append("oauth1 skipped (missing X_ACCESS_TOKEN_OAUTH1 / X_ACCESS_TOKEN_SECRET)")
+
+    # 2) OAuth 2.0 v2
+    token, tok_err = ensure_access_token()
+    if token:
+        mid, err = _upload_oauth2_v2(image_bytes, media_type, token)
+        if mid:
+            return mid, ""
+        errors.append(err)
+    else:
+        errors.append(tok_err or "no oauth2 token")
 
     return None, " | ".join(errors)
 
@@ -299,7 +337,6 @@ def post_tweet(
     *,
     base_url: Optional[str] = None,
 ) -> dict:
-    # Always ensure we have a fresh-enough token
     token, tok_err = ensure_access_token()
     if not token:
         return {"success": False, "error": f"Auth failed: {tok_err}"}
@@ -333,22 +370,13 @@ def post_tweet(
 
     try:
         with httpx.Client(timeout=30.0) as client:
-            r = client.post(
-                f"{X_API_BASE}/tweets",
-                headers=_auth_headers(token),
-                json=body,
-            )
+            r = client.post(f"{X_API_BASE}/tweets", headers=_auth_headers(token), json=body)
 
-            # Token expired mid-request → refresh and retry once
-            if r.status_code in (401, 403):
+            if r.status_code in (401, 403) and "duplicate" not in r.text.lower():
                 new_t, refresh_err = refresh_access_token()
                 if new_t:
-                    r = client.post(
-                        f"{X_API_BASE}/tweets",
-                        headers=_auth_headers(new_t),
-                        json=body,
-                    )
-                else:
+                    r = client.post(f"{X_API_BASE}/tweets", headers=_auth_headers(new_t), json=body)
+                elif r.status_code == 401:
                     return {
                         "success": False,
                         "error": f"X API {r.status_code}: token expired and refresh failed: {refresh_err}",
