@@ -17,7 +17,7 @@ from imagine import generate_image
 app = FastAPI(
     title="SocialForge",
     description="AI-Powered Social Media Automation with Grok 4.5 + Grok Imagine",
-    version="0.7.0",
+    version="0.7.1",
 )
 
 static_dir = Path(__file__).parent / "static"
@@ -37,7 +37,6 @@ def startup():
         print(f"Scheduler start skipped: {e}")
 
 
-# ---------- Schemas ----------
 class StatusUpdate(BaseModel):
     status: str
 
@@ -45,7 +44,7 @@ class ImageUrlUpdate(BaseModel):
     image_url: str
 
 class ScheduleUpdate(BaseModel):
-    scheduled_at: Optional[datetime] = None  # ISO datetime; if None, schedule in 1 min
+    scheduled_at: Optional[datetime] = None
 
 class GenerateImageResponse(BaseModel):
     post_id: int
@@ -111,7 +110,6 @@ def app_base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
-# ---------- UI ----------
 @app.get("/")
 def ui():
     index = static_dir / "index.html"
@@ -125,13 +123,12 @@ def api_root():
     from x_poster import is_configured
     return {
         "message": "SocialForge API",
-        "version": "0.7.0",
+        "version": "0.7.1",
         "x_configured": is_configured(),
         "docs": "/docs",
     }
 
 
-# ---------- Drive image proxy ----------
 @app.get("/media/drive/{file_id}")
 async def proxy_drive_image(file_id: str):
     if file_id in _image_cache:
@@ -171,7 +168,6 @@ async def proxy_drive_image(file_id: str):
     )
 
 
-# ---------- Posts ----------
 @app.get("/posts")
 def list_posts(
     status: Optional[str] = Query(None),
@@ -245,7 +241,6 @@ def set_image_url(post_id: int, body: ImageUrlUpdate, db: Session = Depends(get_
 
 @app.post("/posts/{post_id}/schedule")
 def schedule_post(post_id: int, body: ScheduleUpdate, db: Session = Depends(get_db)):
-    """Mark post as scheduled. Default: 1 minute from now."""
     post = db.query(Post).filter(Post.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -259,7 +254,6 @@ def schedule_post(post_id: int, body: ScheduleUpdate, db: Session = Depends(get_
 
 @app.post("/posts/{post_id}/post-to-x")
 def post_to_x_now(post_id: int, request: Request, db: Session = Depends(get_db)):
-    """Immediately post this item to X."""
     from x_poster import post_tweet, is_configured
 
     if not is_configured():
@@ -292,15 +286,18 @@ def post_to_x_now(post_id: int, request: Request, db: Session = Depends(get_db))
             "success": True,
             "tweet_id": result.get("tweet_id"),
             "media_attached": result.get("media_attached"),
+            "media_error": result.get("media_error") or "",
             "post": serialize_post(post),
         }
 
     post.status = "failed"
     db.commit()
-    raise HTTPException(status_code=502, detail=result.get("error", "Post failed"))
+    raise HTTPException(
+        status_code=502,
+        detail=result.get("error", "Post failed"),
+    )
 
 
-# ---------- Image generation ----------
 @app.post("/posts/{post_id}/generate-image", response_model=GenerateImageResponse)
 def generate_post_image(
     post_id: int,
@@ -401,4 +398,5 @@ def health():
         "timestamp": datetime.utcnow().isoformat(),
         "cached_images": len(_image_cache),
         "x_configured": is_configured(),
+        "app_base_url": os.getenv("APP_BASE_URL", ""),
     }
