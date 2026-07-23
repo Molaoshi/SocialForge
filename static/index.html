@@ -92,7 +92,7 @@
       <div id="status-msg" class="ml-auto text-sm text-gray-400"></div>
     </div>
     <p class="text-xs text-gray-500 mt-3">
-      <strong>Post to X</strong> = publish now · <strong>Schedule</strong> = auto-post in ~1 min (scheduler runs every 2 min)
+      <strong>Post to X</strong> = publish now · <strong>Schedule</strong> = auto-post in ~1 min
     </p>
   </div>
 
@@ -104,19 +104,19 @@
     </div>
   </main>
 
-  <div id="toast" class="fixed bottom-6 right-6 px-5 py-3 rounded-xl bg-cyber-card border border-cyber-border shadow-xl text-sm opacity-0 transition-opacity duration-300 pointer-events-none z-50"></div>
+  <div id="toast" class="fixed bottom-6 right-6 px-5 py-3 rounded-xl bg-cyber-card border border-cyber-border shadow-xl text-sm opacity-0 transition-opacity duration-300 pointer-events-none z-50 max-w-md"></div>
 
   <script>
     function toast(msg, type = 'info') {
       const el = document.getElementById('toast');
       el.textContent = msg;
-      el.className = `fixed bottom-6 right-6 px-5 py-3 rounded-xl border shadow-xl text-sm z-50 transition-opacity duration-300 ${
+      el.className = `fixed bottom-6 right-6 px-5 py-3 rounded-xl border shadow-xl text-sm z-50 transition-opacity duration-300 max-w-md ${
         type === 'error' ? 'bg-red-950 border-red-700 text-red-200' :
         type === 'success' ? 'bg-emerald-950 border-emerald-700 text-emerald-200' :
         'bg-cyber-card border-cyber-border text-gray-200'
       }`;
       el.style.opacity = '1';
-      setTimeout(() => el.style.opacity = '0', 4000);
+      setTimeout(() => el.style.opacity = '0', 6000);
     }
 
     function setStatus(msg) {
@@ -268,7 +268,13 @@
         const res = await fetch(`/posts/${postId}/post-to-x`, { method: 'POST' });
         const data = await res.json().catch(() => ({}));
         if (res.ok && data.success) {
-          toast(`Posted! tweet id: ${data.tweet_id}${data.media_attached ? ' (with image)' : ' (text only)'}`, 'success');
+          if (data.media_attached) {
+            toast(`Posted with image! id: ${data.tweet_id}`, 'success');
+          } else if (data.media_error) {
+            toast(`Posted text only. Image failed: ${data.media_error}`, 'error');
+          } else {
+            toast(`Posted text only. id: ${data.tweet_id}`, 'success');
+          }
           loadPosts();
         } else {
           toast(data.detail || data.error || 'Post failed', 'error');
